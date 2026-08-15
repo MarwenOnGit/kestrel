@@ -23,10 +23,35 @@ C = 299_792_458.0
 
 
 # --------------------------------------------------------------------------
-def path_loss_db(d_m: float, freq_hz: float, excess_db: float = 0.0) -> float:
-    """Free-space path loss plus optional terrain/foliage excess loss."""
+def radio_horizon_m(h_rx_m: float, h_tx_m: float = 2.0, k: float = 4.0 / 3.0) -> float:
+    """Line-of-sight distance over a curved earth, with the standard 4/3-earth
+    factor for atmospheric refraction.
+
+    At 120 m altitude this is about 50 km to a handheld at ground level. It is
+    the single number that decides how much ground one aircraft can cover, and
+    it is why altitude buys more sensitivity than any amplifier (Doc 00 §1).
+    """
+    R = 6_371_000.0
+    return math.sqrt(2 * k * R * max(h_rx_m, 0.0)) + math.sqrt(2 * k * R * max(h_tx_m, 0.0))
+
+
+def path_loss_db(d_m: float, freq_hz: float, excess_db: float = 0.0,
+                 h_rx_m: float | None = None, h_tx_m: float = 2.0,
+                 beyond_horizon_db_per_km: float = 1.2) -> float:
+    """Free-space path loss, plus diffraction loss beyond the radio horizon.
+
+    Free space alone is badly wrong at range: a 5 W handheld 300 km away still
+    computes to +11 dB SNR, so without a horizon term the simulator reports
+    detections from the other side of the country. Beyond line of sight the
+    signal must diffract around the earth, and the loss climbs steeply.
+    """
     d_m = max(d_m, 1.0)
     fspl = 20 * math.log10(d_m) + 20 * math.log10(freq_hz) - 147.55
+
+    if h_rx_m is not None:
+        horizon = radio_horizon_m(h_rx_m, h_tx_m)
+        if d_m > horizon:
+            excess_db += beyond_horizon_db_per_km * (d_m - horizon) / 1000.0
     return fspl + excess_db
 
 
@@ -152,7 +177,8 @@ class KestrelSim:
                     continue
                 d = float(np.linalg.norm(e.xy - a.xy))
                 slant = math.sqrt(d * d + a.alt_m * a.alt_m)
-                rx_dbm = e.eirp_dbm - path_loss_db(slant, e.freq_hz)
+                rx_dbm = e.eirp_dbm - path_loss_db(slant, e.freq_hz,
+                                                   h_rx_m=a.alt_m)
                 snr = rx_dbm - self.noise_floor_dbm
                 if snr < self.detection_threshold_db:
                     continue

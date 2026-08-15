@@ -1,6 +1,6 @@
 # 13 — Implementation Status
 
-**As of 2026-08-15.** What is built, what is measured, what is known to be
+**As of 2026-08-15 (Step 3 complete).** What is built, what is measured, what is known to be
 broken. Updated as work proceeds; do not let it drift from the code.
 
 ---
@@ -12,14 +12,14 @@ broken. Updated as work proceeds; do not let it drift from the code.
 | 0. Repo + message contracts | **Done** |
 | 1. KestrelSim (detection-level) | **Done** |
 | 2. Legal spine (token, gate, sealing, audit) | **Done** |
-| 3. DSP chain (FFT/CFAR/channelize) | Not started — sim feeds detections directly |
-| 4. Classifier (trained) | Stub only (`StubClassifier`, SNR-dependent confusion) |
+| 3. DSP chain (FFT/CFAR/channelize) | **Done** — real IQ in, Detections out |
+| 4. Classifier (trained) | Rule-based `FeatureClassifier` on real IQ; no trained network yet |
 | 5. Coarse geolocation | **Done** — batch MLE with systematic-error budget |
 | 6. Autonomy agent | **Done** — behaviour tree, safety layer, info-gain planner |
 | 7. Ground station | Partial — audit + fusion primitives; no web map yet |
 | 8. Hardware bring-up | Blocked on hardware |
 
-**44 tests pass, 1 xfail** (a recorded known limitation, `strict=True`, so it
+**80 tests pass, 1 xfail** (a recorded known limitation, `strict=True`, so it
 fails the build if it starts unexpectedly passing).
 
 Run everything: `python3 -m pytest tests/ -q` (~4 min, no hardware).
@@ -128,10 +128,13 @@ for writing narrower warrants. Fingerprinting (Phase 3) is what eventually
 distinguishes devices on a shared channel.
 
 ### 4.3 Not yet real
-- No DSP: detections come from the simulator, not from IQ.
-- Classifier is a stub with a confusion model, not a trained network.
-- Recorded IQ is a zero-filled placeholder — the sealing path is real, the
-  contents are not.
+- Classifier is rule-based over hand-picked features, not a trained network.
+  It abstains readily, which is safe but misses captures.
+- The mission loop still uses the detection-level simulator; the IQ pipeline is
+  exercised separately (`tests/test_pipeline.py`, `tools/dsp_demo.py`). Wiring
+  the IQ path into `run_mission` is the next integration step.
+- Recorded IQ in the mission loop is still a zero-filled placeholder — the
+  sealing path is real, the contents are not.
 - Single-aircraft geolocation only; no TDOA, no SADF, no swarm choreography.
 - Ground station has no map yet.
 
@@ -145,15 +148,79 @@ characterized properly on real data.
 
 ## 5. What to build next
 
-1. **Step 3 — the DSP chain.** Replace simulated detections with FFT → CFAR →
-   channelize over synthetic IQ. Biggest step toward reality.
+1. **Wire the IQ pipeline into `run_mission`.** The DSP chain and the mission
+   loop both work; they are not yet joined. This closes the last shortcut.
 2. **Step 7 — the ground map.** Cheap, and makes everything else demonstrable.
-3. **Step 4 — the classifier.** Needs an IQ library; start recording early.
+3. **Step 4 — the trained classifier.** The IQ library now exists
+   (`kestrel/sim/iq_synth.py` generates 12 classes), so training data is no
+   longer blocked. Split by recording session, train across -5..+30 dB.
 4. **Multi-hypothesis association** (§4.1) — or defer it to Phase 2 TDOA, which
    may make it moot. Decide deliberately rather than by drift.
 
-Do **not** start Phase 2 hardware work until Steps 3, 4 and 7 are done in
-simulation.
+Do **not** start Phase 2 hardware work until 1, 2 and 3 are done in simulation.
+
+---
+
+## 5a. Step 3 — the DSP chain (added 2026-08-15)
+
+Real signal processing now replaces the geometry shortcut, at least in the
+pipeline tests and the demo (`python3 tools/dsp_demo.py`):
+
+    IQ -> Welch PSD -> noise floor -> CFAR + wideband -> channelize
+       -> features -> classify -> Detection -> warrant gate
+
+`kestrel/sim/iq_synth.py` synthesizes 12 signal classes as actual waveforms
+(4FSK, pi/4-DQPSK, chirp, OFDM, GFSK, BPSK, FM, AM), composes them into a
+wideband scene with link-budget-correct SNRs, and the pipeline is told nothing
+about what is present. On the demo scene it finds all three in-band emitters
+within 200 Hz, classifies each correctly, and the gate authorizes exactly the
+two the warrant covers.
+
+**Five more bugs found by measurement, continuing the list in §3:**
+
+9.  **CFAR self-masking.** A 50 kHz signal is 205 bins wide, so CFAR's training
+    cells landed *inside* it, the local background rose with the signal, and it
+    became invisible to its own detector. CFAR cannot see anything wider than
+    its training window. Fixed by running a global threshold against the robust
+    noise floor alongside CFAR and taking the union — neither detector is
+    sufficient alone.
+
+10. **Bandwidth understated 6x.** Detection flags only the strong middle of a
+    signal, so a 12.5 kHz DMR carrier was reported as 2 kHz. Now measured as
+    the conventional 99%-power occupied bandwidth, with the frequency taken
+    from the power centroid rather than the span midpoint.
+
+11. **Duplicate candidates.** Two detectors firing on one signal expanded to
+    identical spans; deduplication ran before expansion instead of after, so
+    one emitter was reported three times.
+
+12. **Hanning sidelobes.** At -31 dB, one strong emitter smeared across the
+    band and masked weak neighbours — the exact failure this system exists to
+    avoid. Switched to Blackman: wider main lobe, far lower sidelobes.
+    Dynamic range beats frequency resolution in surveillance.
+
+13. **No radio horizon.** Free-space loss alone gives a 5 W handheld at 300 km
+    an SNR of +11 dB, so the simulator happily detected emitters from the far
+    side of the country. Added a 4/3-earth horizon (about 51 km at 120 m
+    altitude) with diffraction loss beyond it. This governs how much ground one
+    aircraft can cover and had been silently missing since day one.
+
+**And two synthesizer faults, which matter because a simulator that emits
+signals no radio would produce tests the DSP against fiction:**
+
+- OFDM symbols butted together left phase discontinuities that splattered
+  across the whole span and lifted the measured floor by 10 dB. Real
+  transmitters window their symbol edges; now so does this one.
+- The interpolation filter's -75 dBc stopband left images every 50 kHz, and
+  against a 97 dB signal the detector dutifully reported nine emitters that did
+  not exist. Steepened to a Kaiser-16 filter.
+
+**A useful negative result:** the LoRa-vs-satcom discriminator (how linearly
+instantaneous frequency ramps) separates cleanly at 40 dB SNR (0.10 vs 1.41)
+and degrades to uselessness by 8 dB (1.17 vs 1.46). The threshold is therefore
+SNR-dependent and the classifier abstains below 10 dB. This is what Doc 05's
+"measure accuracy per SNR bucket, not overall" looks like in practice, and it
+is the concrete argument for a trained model over hand-written rules.
 
 ---
 
