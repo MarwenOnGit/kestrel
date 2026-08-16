@@ -17,7 +17,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from kestrel.air.detector import channelize, features, find_candidates
+from kestrel.air.detector import (EDGE_GUARD_FRAC, channelize, features,
+                                  find_candidates)
 from kestrel.common.messages import Detection
 
 
@@ -55,13 +56,38 @@ class SweepPlan:
 
     @classmethod
     def from_bands(cls, bands: list[tuple[float, float]], rate_sps: float = 20e6,
-                   dwell_s: float = 0.2, n_aircraft: int = 1) -> "SweepPlan":
+                   dwell_s: float = 0.2, n_aircraft: int = 1,
+                   overlap_frac: float = 0.08) -> "SweepPlan":
+        """Tile the bands with overlapping segments.
+
+        The overlap is not waste. Abutting segments put a hard seam in the
+        middle of the spectrum, and an emitter that lands on one sits at the
+        edge of both windows - exactly where the front end rolls off and where
+        energy past Nyquist folds back, so it is detected as an artifact at the
+        far edge of the band or missed altogether.
+
+        How much overlap is enough: the worst case is a frequency exactly
+        between two segment centres, at `rate x (1 - overlap) / 2`. For that to
+        stay inside the detector's trustworthy middle (|offset| < 0.48 x rate,
+        given `EDGE_GUARD_FRAC` = 2%) the overlap must exceed 4%. The default
+        doubles that, which costs ~8% more segments - and revisit time is what
+        that buys, so it is stated rather than buried.
+
+        The band's own two ends need the same treatment: tiling naively from
+        `lo + rate/2` leaves the first frequency of the band sitting exactly on
+        the first window's edge, permanently inside the guard. The first centre
+        is therefore pulled down so that `lo` starts out well inside it.
+        """
         segs = []
+        step = rate_sps * (1.0 - max(overlap_frac, 0.0))
+        usable_half = rate_sps * (0.5 - EDGE_GUARD_FRAC)
         for lo, hi in bands:
-            f = lo + rate_sps / 2
-            while f - rate_sps / 2 < hi:
+            f = lo + 0.95 * usable_half
+            while True:
                 segs.append(SweepSegment(f, rate_sps, dwell_s))
-                f += rate_sps
+                if f + 0.95 * usable_half >= hi:
+                    break
+                f += step
         return cls(segs, n_aircraft=n_aircraft)
 
     def revisit_time_s(self) -> float:
@@ -134,6 +160,9 @@ class EdgePipeline:
                 snr_db=c.snr_db,
                 aircraft_pos_xy=(float(aircraft_pos_xy[0]), float(aircraft_pos_xy[1])),
                 aircraft_alt_m=aircraft_alt_m,
+                # Measured from the snippet, never assumed: this is what the
+                # warrant is charged for.
+                capture_duration_s=len(snippet) / max(snip_fs, 1.0),
             )
             if bearing_fn is not None:
                 b = bearing_fn(c)

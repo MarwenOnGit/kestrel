@@ -13,6 +13,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
+# The outer fraction of a tuned window that is not trustworthy: the analog
+# anti-alias filter is rolling off there, energy past Nyquist folds back on top
+# of whatever is present, and DC offset and LO leakage pile up. Candidates
+# landing here are discarded, and `SweepPlan` overlaps its segments so that the
+# discarded slice is always inside a neighbour - one design across two files.
+EDGE_GUARD_FRAC = 0.02
+
 
 # --------------------------------------------------------------------------
 def welch_psd(iq: np.ndarray, nfft: int = 4096, averages: int = 16,
@@ -194,8 +201,18 @@ def _power_containment_span(psd_db: np.ndarray, lo: int, hi: int,
 
 def find_candidates(iq: np.ndarray, rate_sps: float, center_hz: float,
                     nfft: int = 4096, threshold_db: float = 8.0,
-                    averages: int = 16) -> list[Candidate]:
-    """Full detection stage: IQ -> list of candidate signals."""
+                    averages: int = 16,
+                    edge_guard_frac: float = EDGE_GUARD_FRAC) -> list[Candidate]:
+    """Full detection stage: IQ -> list of candidate signals.
+
+    `edge_guard_frac` discards candidates whose centre falls in the outermost
+    fraction of the band. The edges of a tuned window are where a receiver is
+    least trustworthy: the analog anti-alias filter is rolling off, energy just
+    beyond Nyquist folds back on top of whatever is there, and DC offset and
+    LO leakage pile up. Anything genuinely at the edge of one segment sits
+    comfortably inside the next one, because `SweepPlan` overlaps them - so a
+    guard band costs no coverage and removes a whole class of phantom emitter.
+    """
     psd = welch_psd(iq, nfft=nfft, averages=averages)
     nf = noise_floor(psd)
 
@@ -206,10 +223,13 @@ def find_candidates(iq: np.ndarray, rate_sps: float, center_hz: float,
     spans = [_occupied_span(psd, g[0], g[-1], nf) for g in raw]
     groups = _merge_overlapping([list(range(a, b + 1)) for a, b in spans])
 
+    guard_bins = int(edge_guard_frac * nfft)
     out = []
     for g in groups:
         lo, hi = g[0], g[-1]
         lo, hi = _power_containment_span(psd, lo, hi, fraction=0.99)
+        if guard_bins and not (guard_bins <= (lo + hi) / 2 <= nfft - 1 - guard_bins):
+            continue
         peak_bin = int(lo + int(np.argmax(psd[lo:hi + 1])))
         # Centre on the power centroid, not the span midpoint: asymmetric
         # skirts would otherwise bias the reported frequency.

@@ -76,8 +76,11 @@ class TensorRTClassifier:
             "Use StubClassifier until a trained model exists.")
 
 
-def apply_classification(det: Detection, classifier) -> Detection:
-    cls, conf = classifier.classify(det)
+def apply_classification(det: Detection, classifier,
+                         iq: np.ndarray | None = None) -> Detection:
+    """Classify in place. `iq` is the narrowband snippet for this detection;
+    the stub ignores it, a real model cannot work without it."""
+    cls, conf = classifier.classify(det, iq)
     det.signal_class = cls
     det.class_confidence = conf
     det.model_version = getattr(classifier, "model_version", "unknown")

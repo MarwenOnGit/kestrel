@@ -19,15 +19,19 @@ import numpy as np
 
 from kestrel.air.agent import MissionAgent
 from kestrel.air.classifier import StubClassifier
+from kestrel.air.pipeline import EdgePipeline, FeatureClassifier, SweepPlan
 from kestrel.air.planner import InfoGainPlanner
 from kestrel.air.safety import SafetyLayer
+from kestrel.air.sdr_source import SimulatedSdrSource
 from kestrel.air.sealer import CollectionController, Sealer
+from kestrel.air.sensor import RfSensor
 from kestrel.air.track import TrackStore
 from kestrel.air.warrant_gate import WarrantGate
 from kestrel.common import crypto
 from kestrel.common.warrant import WarrantToken
 from kestrel.ground import signer
 from kestrel.ground.audit import AuditLog
+from kestrel.sim.simulated_df import SimulatedDf
 from kestrel.sim.world import Aircraft, KestrelSim
 
 
@@ -45,14 +49,34 @@ class MissionResult:
     emitters: list = field(default_factory=list)
     token: Any = None
     workdir: str = ""
+    sensor_health: dict = field(default_factory=dict)
 
 
 def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
                 warrant_overrides: dict | None = None,
                 planner_factory=None, workdir: str | None = None,
                 seed: int = 0, geofence=None, revoke_at_s: float | None = None,
-                durable: bool = False) -> MissionResult:
-    """Fly one sortie. Returns everything needed to evaluate it."""
+                durable: bool = False,
+                iq_mode: bool = False, sweep_bands=None,
+                sweep_rate_sps: float = 2e6, dwell_s: float = 0.2,
+                max_frames_per_step: int | None = None) -> MissionResult:
+    """Fly one sortie. Returns everything needed to evaluate it.
+
+    Two sensing paths, one mission loop:
+
+      * default - `KestrelSim.generate_detections()` produces Detections from
+        geometry. ~1000x real time, which is what makes autonomy development
+        and 20-seed regression runs practical.
+      * `iq_mode=True` - each aircraft carries an `RfSensor`: a real SDR
+        source, a real sweep with real dwell accounting, and the real DSP chain
+        (PSD -> CFAR -> channelize -> features -> classify). Detections are
+        *found*, not handed over, and the IQ that reaches the sealer is the
+        actual signal rather than a placeholder.
+
+    The second is what will run in the air. It is roughly 100x slower and it
+    finds less, both of which are the point: everything the sweep misses is
+    something a real receiver would also have missed.
+    """
     workdir = workdir or tempfile.mkdtemp(prefix="kestrel_sortie_")
     os.makedirs(workdir, exist_ok=True)
 
@@ -70,7 +94,26 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
 
     # ---- per-aircraft airborne stack -----------------------------------
     agents: dict[str, MissionAgent] = {}
+    sensors: dict[str, Any] = {}
+    dfs: dict[str, Any] = {}
     area = _area_from_polygon(geofence)
+
+    if iq_mode:
+        # Sweep the bands the warrant covers. Detection is not limited by the
+        # warrant - the gate decides what may be RECORDED, not what may be
+        # heard - but a sortie is flown to serve a warrant, and receiver time
+        # spent outside its bands is time not spent on the task.
+        bands = sweep_bands or [tuple(r) for r in token.body["freq_ranges_hz"]]
+        sweep = SweepPlan.from_bands(bands, rate_sps=sweep_rate_sps,
+                                     dwell_s=dwell_s,
+                                     n_aircraft=len(sim.aircraft))
+        audit.append("SWEEP_PLAN", {
+            "bands_hz": [list(b) for b in bands],
+            "segments": len(sweep.segments),
+            "rate_sps": sweep_rate_sps,
+            "dwell_s": dwell_s,
+            "revisit_time_s": sweep.revisit_time_s()})
+
     for ac in sim.aircraft:
         gate = WarrantGate(token, audit)
         sealer = Sealer(seal_pk, os.path.join(workdir, "vault", ac.aircraft_id),
@@ -78,6 +121,23 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
         controller = CollectionController(gate, sealer, audit)
         safety = SafetyLayer(geofence, home_xy=tuple(ac.xy))
         planner = (planner_factory() if planner_factory else InfoGainPlanner())
+
+        if iq_mode:
+            idx = sim.aircraft.index(ac)
+            source = SimulatedSdrSource(sim, ac.aircraft_id, seed=seed + idx)
+            df = SimulatedDf(sim, source, ac.aircraft_id)
+            classifier = FeatureClassifier()
+            sensors[ac.aircraft_id] = RfSensor(
+                source=source,
+                pipeline=EdgePipeline(classifier, aircraft_id=ac.aircraft_id),
+                sweep_plan=sweep,
+                sector=sweep.sector_for(idx),
+                df=df,
+                max_frames_per_step=max_frames_per_step)
+            dfs[ac.aircraft_id] = df
+        else:
+            classifier = StubClassifier(seed=seed + hash(ac.aircraft_id) % 1000)
+
         agents[ac.aircraft_id] = MissionAgent(
             aircraft_id=ac.aircraft_id,
             planner=planner,
@@ -85,7 +145,7 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
             area=area,
             controller=controller,
             track_store=TrackStore(),
-            classifier=StubClassifier(seed=seed + hash(ac.aircraft_id) % 1000),
+            classifier=classifier,
             audit=audit,
             seed=seed,
         )
@@ -95,8 +155,11 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
     steps = int(duration_s / dt)
     now = 0.0
     for _ in range(steps):
-        dets = sim.step(dt, waypoints)
-        all_dets.extend(dets)
+        # In IQ mode the world still advances - aircraft fly, emitters key up
+        # and stop - but it hands out no detections: the sensor must find them
+        # in samples or not at all.
+        world_dets = sim.step(dt, waypoints, generate=not iq_mode)
+        all_dets.extend(world_dets)
         now += dt
 
         if revoke_at_s is not None and now >= revoke_at_s:
@@ -108,11 +171,22 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
             ag = agents[ac.aircraft_id]
             neighbors = [tuple(o.xy) for o in sim.alive_aircraft
                          if o.aircraft_id != ac.aircraft_id]
+
+            if iq_mode:
+                dets, iq_by_det = _sense(sim, sensors[ac.aircraft_id],
+                                         dfs[ac.aircraft_id], ac, dt)
+                all_dets.extend(dets)
+            else:
+                dets, iq_by_det = world_dets, None
+
             waypoints[ac.aircraft_id] = ag.tick(
                 dets, tuple(ac.xy), ac.battery_pct, dt,
-                neighbors=neighbors, now=_wall_now(token, now))
+                neighbors=neighbors, now=_wall_now(token, now),
+                iq_by_detection=iq_by_det)
             ag.safety.check_position(tuple(ac.xy))
 
+    for acid, s in sensors.items():
+        audit.append("SENSOR_HEALTH", {"aircraft_id": acid, **s.health()})
     audit.append("SORTIE_END", {"t": now})
     ok, _bad = audit.verify()
 
@@ -133,7 +207,26 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
         emitters=sim.emitters,
         token=token,
         workdir=workdir,
+        sensor_health={k: s.health() for k, s in sensors.items()},
     )
+
+
+def _sense(sim, sensor, df, ac, dt: float):
+    """One aircraft's slice of receiver time, through the real DSP chain.
+
+    The two simulator-only touches are isolated here, both after the pipeline
+    has committed to what it found:
+      * the reported position carries GPS error, as the detection-level path
+        does - the aircraft does not know exactly where it is;
+      * timestamps and truth tags are applied by the simulated DF.
+    Neither can change what was detected, only how it is labelled.
+    """
+    reported = sim.reported_position(ac)
+    results = sensor.sense(dt, (float(reported[0]), float(reported[1])),
+                           alt_m=ac.alt_m, on_detection=df.annotate)
+    dets = [det for det, _ in results]
+    iq_by_det = {det.detection_id: snippet for det, snippet in results}
+    return dets, iq_by_det
 
 
 def _wall_now(token, sim_t: float) -> float:

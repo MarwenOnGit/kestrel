@@ -37,6 +37,12 @@ class Detection:
     bearing_sigma_deg: float | None = None
     aircraft_alt_m: float = 120.0
 
+    # How much signal time this detection's IQ snippet represents. The warrant
+    # charges recorded seconds against its budget, so this is a legal quantity,
+    # not a diagnostic: it must come from the samples actually held, never from
+    # an assumption. 0.0 means "no snippet" (detection-level simulation).
+    capture_duration_s: float = 0.0
+
     warrant_match: bool = False
     warrant_id: str | None = None
     warrant_reasons: list[str] = field(default_factory=list)

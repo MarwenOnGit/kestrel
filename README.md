@@ -78,8 +78,20 @@ Each phase ends in a flight test and a sign-off.
 
 ## Quick status
 
-Phase 1 not yet started. Begin with
-[`docs/11-phase1-implementation-plan.md`](docs/11-phase1-implementation-plan.md).
+**Phase 1 in progress, in simulation.** Steps 0–3, 5 and 6 of
+[`docs/11-phase1-implementation-plan.md`](docs/11-phase1-implementation-plan.md)
+are built: simulator, legal spine, DSP chain, geolocation, autonomy agent — and
+the DSP chain now flies inside the mission loop, so a sortie's detections are
+found in IQ samples rather than derived from geometry. Still open: the trained
+classifier (Step 4), the ground map (Step 7), and everything needing hardware
+(Step 8).
+
+    python3 -m pytest tests/ -q                                  # 104 pass, 1 xfail
+    python3 -m kestrel.sim.run --scenario border_crossing --iq   # fly a sortie on IQ
+    python3 tools/dsp_demo.py                                    # the DSP funnel, one frame
+
+Read [`docs/13-implementation-status.md`](docs/13-implementation-status.md) for
+what is measured, what is known broken, and every bug found so far.
 
 ## Before you spend money
 

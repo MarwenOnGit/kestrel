@@ -120,6 +120,40 @@ def test_find_candidates_reports_frequency_bandwidth_and_snr():
     assert c.snr_db > 15.0
 
 
+def test_an_emitter_on_the_tuning_boundary_produces_no_phantom_at_the_far_edge():
+    """A signal at exactly fs/2 wraps around the spectrum.
+
+    Found in a swarm sortie: an emitter sitting on the seam between two sweep
+    segments was placed at Nyquist, wrapped, and was reported as a 78 dB
+    emitter at BOTH edges of the band - 360 phantom detections, 192 of them
+    sealed into the vault because they were in-band and looked like FM voice.
+
+    Two independent defences, both asserted here: the synthesizer applies the
+    front-end roll-off a real receiver has near Nyquist, and the detector
+    discards candidates that land in the outer 2% of the window (the sweep
+    overlaps enough that this costs no coverage).
+    """
+    scene = iq_synth.compose_scene(
+        N, FS, center_hz=463.0e6,
+        signals=[{"freq_hz": 463.0e6 + FS / 2, "signal_class": "fm_voice",
+                  "snr_db": 80.0, "bandwidth_hz": 12_500.0}],
+        rng=np.random.default_rng(3))
+    assert find_candidates(scene, FS, 463.0e6) == []
+
+
+def test_the_edge_guard_does_not_swallow_signals_inside_the_band():
+    """The guard must be narrow enough to be free: 5% in is still detected."""
+    offset = 0.4 * FS / 2
+    scene = iq_synth.compose_scene(
+        N, FS, center_hz=463.0e6,
+        signals=[{"freq_hz": 463.0e6 + offset, "signal_class": "fm_voice",
+                  "snr_db": 30.0, "bandwidth_hz": 12_500.0}],
+        rng=np.random.default_rng(4))
+    cands = find_candidates(scene, FS, 463.0e6)
+    assert len(cands) == 1
+    assert abs(cands[0].freq_hz - (463.0e6 + offset)) < 5_000
+
+
 def test_weak_signals_fall_below_detection_and_strong_ones_do_not():
     """Sensitivity is a threshold, not a cliff at 0 dB - verify both sides."""
     def n_found(snr):

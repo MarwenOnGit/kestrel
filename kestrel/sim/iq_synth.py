@@ -218,6 +218,20 @@ def compose_scene(n: int, rate_sps: float, center_hz: float,
             continue                              # outside the tuned window
         bw = s.get("bandwidth_hz", 12_500.0)
 
+        # Front-end roll-off. A real receiver's usable bandwidth is smaller
+        # than its sample rate: the anti-alias filter is already falling by the
+        # time you reach Nyquist. Without modelling that, a signal sitting on
+        # the tuning boundary is placed exactly at fs/2, where its own
+        # bandwidth wraps around and it appears at FULL STRENGTH at both edges
+        # of the band - an 80 dB emitter that does not exist, in two places at
+        # once. The detector cannot be blamed for finding what the
+        # synthesizer put there.
+        edge_frac = abs(offset) / (rate_sps / 2)
+        if edge_frac > 0.9:
+            rolloff_db = 60.0 * (edge_frac - 0.9) / 0.1
+        else:
+            rolloff_db = 0.0
+
         # Generate at a rate matched to the signal, then interpolate up to the
         # wideband rate - generating narrowband modes directly at 20 Msps is
         # both wasteful and numerically poor.
@@ -240,7 +254,7 @@ def compose_scene(n: int, rate_sps: float, center_hz: float,
         if len(base) < n:
             base = np.pad(base, (0, n - len(base)))
 
-        amp = math.sqrt(noise_p * (10.0 ** (s["snr_db"] / 10.0)))
+        amp = math.sqrt(noise_p * (10.0 ** ((s["snr_db"] - rolloff_db) / 10.0)))
         t = np.arange(n)
         scene = scene + (amp * base * np.exp(2j * np.pi * offset / rate_sps * t)
                          ).astype(np.complex64)

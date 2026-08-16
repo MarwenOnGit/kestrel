@@ -26,13 +26,30 @@ def build_sim(emitters, aircraft_xy=(2000.0, 3000.0), seed=0):
 # ------------------------------------------------------------------ sweep
 def test_sweep_plan_covers_bands_and_reports_revisit_time():
     plan = SweepPlan.from_bands([(460e6, 480e6)], rate_sps=20e6, dwell_s=0.2)
-    assert len(plan.segments) == 1
-    assert plan.revisit_time_s() == pytest.approx(0.2)
+    # Two segments for a 20 MHz band on a 20 MHz radio: one window's edges fall
+    # in the detector's guard band, so a single segment cannot cover the band's
+    # own edges trustworthily. Overlap is coverage, not waste.
+    assert len(plan.segments) == 2
+    assert plan.revisit_time_s() == pytest.approx(0.4)
 
     wide = SweepPlan.from_bands([(30e6, 520e6), (700e6, 3800e6)],
                                 rate_sps=200e6, dwell_s=0.2)
     assert wide.revisit_time_s() > 0
     assert any(s.contains(462.5e6) for s in wide.segments)
+
+
+def test_every_frequency_lands_in_some_segments_trustworthy_middle():
+    """The guard band and the sweep overlap are one design, not two settings.
+
+    A frequency sitting in the outer 2% of every segment that contains it would
+    be invisible - or worse, seen as an alias at the far edge of the band. This
+    is the arithmetic that stops that happening.
+    """
+    guard = 0.02
+    plan = SweepPlan.from_bands([(462e6, 468e6)], rate_sps=2e6, dwell_s=0.2)
+    for f in np.arange(462e6, 468e6, 25e3):
+        assert any(abs(f - s.center_hz) < (0.5 - guard) * s.rate_sps
+                   for s in plan.segments), f"{f/1e6:.3f} MHz is only ever at a band edge"
 
 
 def test_swarm_division_is_interleaved_and_covers_everything():

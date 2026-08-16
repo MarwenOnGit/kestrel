@@ -56,6 +56,73 @@ def path_loss_db(d_m: float, freq_hz: float, excess_db: float = 0.0,
 
 
 # --------------------------------------------------------------------------
+class BearingModel:
+    """The direction-finding array's error behaviour, in one place.
+
+    Both simulation paths need this: the detection-level path (which never
+    touches a waveform) and the IQ path (whose single-channel synthesis cannot
+    produce a phase front, so the array response has to be modelled rather than
+    measured). Keeping one implementation means the two paths cannot silently
+    disagree about how good DF is - if they did, a geolocation result would
+    depend on which simulator produced it, which would make both meaningless.
+
+    Replacing this with real interferometry is Step 8, and needs multi-channel
+    IQ that `iq_synth` does not yet generate. See docs/13 §4.3.
+    """
+
+    def __init__(self, rng: np.random.Generator,
+                 calibration_bias_sigma_deg: float = 2.0,
+                 airframe_bias_amplitude_deg: float = 1.5,
+                 multipath_rate: float = 0.03):
+        self.rng = rng
+        self.calibration_bias_sigma_deg = calibration_bias_sigma_deg
+        self.airframe_bias_amplitude_deg = airframe_bias_amplitude_deg
+        self.multipath_rate = multipath_rate
+        self._cal_bias: dict[str, float] = {}
+
+    def register(self, aircraft_id: str) -> None:
+        """Residual calibration error: constant for this airframe for the whole
+        sortie. Recalibration reduces it; nothing averages it out."""
+        self._cal_bias.setdefault(aircraft_id, float(
+            self.rng.normal(0, self.calibration_bias_sigma_deg)))
+
+    @staticmethod
+    def sigma_deg(snr_db: float) -> float:
+        """Bearing accuracy improves with SNR - real physics, and the reason
+        the planner benefits from closing range."""
+        return max(0.5, 30.0 / math.sqrt(max(snr_db, 1.0)))
+
+    def bias_deg(self, aircraft_id: str, true_bearing_deg: float) -> float:
+        """Systematic bearing error: a constant per-airframe calibration
+        residual plus an azimuth-dependent airframe reflection term."""
+        const = self._cal_bias.get(aircraft_id, 0.0)
+        airframe = self.airframe_bias_amplitude_deg * math.sin(
+            2.0 * math.radians(true_bearing_deg))
+        return const + airframe
+
+    def measure(self, aircraft_id: str, from_xy, to_xy,
+                snr_db: float) -> tuple[float, float]:
+        """A measured bearing and the sigma the estimator should be told about.
+
+        Note what the sigma does NOT include: the systematic terms. That is
+        deliberate and true to life - an array reports its random uncertainty,
+        and the calibration residual is exactly the error it cannot see. The
+        tracker carries the systematic budget separately (docs/13 §3.5).
+        """
+        sigma = self.sigma_deg(snr_db)
+        true_b = math.degrees(math.atan2(to_xy[1] - from_xy[1],
+                                         to_xy[0] - from_xy[0])) % 360.0
+        meas = (true_b + self.bias_deg(aircraft_id, true_b)
+                + self.rng.normal(0, sigma)) % 360.0
+
+        # Multipath: an occasional clean, confident, WRONG bearing off terrain.
+        # This is what the robust loss in track.solve_batch exists to survive.
+        if self.rng.random() < self.multipath_rate:
+            meas = (meas + self.rng.normal(0, 20.0)) % 360.0
+        return meas, sigma
+
+
+# --------------------------------------------------------------------------
 @dataclass
 class Emitter:
     emitter_id: str
@@ -132,16 +199,15 @@ class KestrelSim:
         self.noise_floor_dbm = noise_floor_dbm
         self.detection_threshold_db = detection_threshold_db
         self.t = 0.0
-        self.multipath_rate = multipath_rate
         self.gps_sigma_m = gps_sigma_m
-        self.airframe_bias_amplitude_deg = airframe_bias_amplitude_deg
-        self._cal_bias: dict[str, float] = {}
+        self.bearing = BearingModel(
+            self.rng,
+            calibration_bias_sigma_deg=calibration_bias_sigma_deg,
+            airframe_bias_amplitude_deg=airframe_bias_amplitude_deg,
+            multipath_rate=multipath_rate)
         for a in aircraft:
             a.clock_error_ns = float(self.rng.normal(0, clock_sigma_ns))
-            # Residual calibration error: constant for this airframe for the
-            # whole sortie. Recalibration reduces it; nothing averages it out.
-            self._cal_bias[a.aircraft_id] = float(
-                self.rng.normal(0, calibration_bias_sigma_deg))
+            self.bearing.register(a.aircraft_id)
 
     # ------------------------------------------------------------------
     @property
@@ -154,8 +220,12 @@ class KestrelSim:
                 a.alive = False
 
     # ------------------------------------------------------------------
-    def step(self, dt: float, waypoints: dict[str, tuple] | None = None
-             ) -> list[Detection]:
+    def step(self, dt: float, waypoints: dict[str, tuple] | None = None,
+             generate: bool = True) -> list[Detection]:
+        """Advance the world. `generate=False` moves everything but produces no
+        detections - used when an `RfSensor` is finding them in samples
+        instead, where geometry-derived detections would be both wasted work
+        and a temptation to fall back on."""
         waypoints = waypoints or {}
         self.t += dt
         for e in self.emitters:
@@ -166,7 +236,7 @@ class KestrelSim:
             # Ornstein-Uhlenbeck style random walk with a long correlation time
             a.gps_bias = (0.999 * a.gps_bias
                           + self.rng.normal(0, self.gps_sigma_m * 0.05, 2))
-        return self.generate_detections()
+        return self.generate_detections() if generate else []
 
     # ------------------------------------------------------------------
     def generate_detections(self) -> list[Detection]:
@@ -183,40 +253,16 @@ class KestrelSim:
                 if snr < self.detection_threshold_db:
                     continue
 
-                # Bearing accuracy improves with SNR - real physics, and the
-                # reason the planner benefits from closing range.
-                sigma_deg = max(0.5, 30.0 / math.sqrt(max(snr, 1.0)))
-                true_b = math.degrees(math.atan2(e.xy[1] - a.xy[1],
-                                                 e.xy[0] - a.xy[0])) % 360.0
-
-                # SYSTEMATIC error. Without this the simulator lies: averaging
-                # hundreds of zero-mean errors drives the fix to sub-metre
-                # accuracy, which no real DF system achieves (Doc 07 §7 predicts
-                # 200-800 m for single-aircraft AOA). Real error is dominated by
-                # terms that do NOT average away:
-                #   * residual array calibration error - constant per aircraft
-                #   * airframe reflection - varies with relative azimuth
-                bias = self._calibration_bias(a.aircraft_id, true_b)
-                meas_b = (true_b + bias + self.rng.normal(0, sigma_deg)) % 360.0
-
-                # Multipath: an occasional clean, confident, WRONG bearing off
-                # terrain. This is what the robust loss in track.solve_batch
-                # exists to survive.
-                if self.rng.random() < self.multipath_rate:
-                    meas_b = (meas_b + self.rng.normal(0, 20.0)) % 360.0
+                # SYSTEMATIC error lives in BearingModel. Without it the
+                # simulator lies: averaging hundreds of zero-mean errors drives
+                # the fix to sub-metre accuracy, which no real DF system
+                # achieves (Doc 07 §7 predicts 200-800 m for single-aircraft
+                # AOA).
+                meas_b, sigma_deg = self.bearing.measure(
+                    a.aircraft_id, a.xy, e.xy, snr)
 
                 t_arrival_ns = int((self.t + slant / C) * 1e9 + a.clock_error_ns)
-
-                # The aircraft does not know its own position perfectly. GPS
-                # error floors how well any amount of averaging can locate an
-                # emitter - without it the simulator reports sub-metre fixes,
-                # which no airborne DF system achieves.
-                # GPS error is CORRELATED over minutes (ionosphere, satellite
-                # geometry, multipath off terrain), not independent per sample.
-                # White noise would average away over hundreds of detections
-                # and leave the fix falsely precise; a slowly drifting bias
-                # does not, which is how real GPS actually behaves.
-                reported_xy = a.xy + a.gps_bias + self.rng.normal(0, 0.5, 2)
+                reported_xy = self.reported_position(a)
 
                 out.append(Detection(
                     aircraft_id=a.aircraft_id,
@@ -234,13 +280,16 @@ class KestrelSim:
                 ))
         return out
 
-    def _calibration_bias(self, aircraft_id: str, true_bearing_deg: float) -> float:
-        """Systematic bearing error: a constant per-airframe calibration
-        residual plus an azimuth-dependent airframe reflection term."""
-        const = self._cal_bias.get(aircraft_id, 0.0)
-        airframe = self.airframe_bias_amplitude_deg * math.sin(
-            2.0 * math.radians(true_bearing_deg))
-        return const + airframe
+    def reported_position(self, a: Aircraft) -> np.ndarray:
+        """Where the aircraft *thinks* it is.
+
+        GPS error floors how well any amount of averaging can locate an
+        emitter. It is CORRELATED over minutes (ionosphere, satellite geometry,
+        multipath off terrain), not independent per sample: white noise would
+        average away over hundreds of detections and leave the fix falsely
+        precise; a slowly drifting bias does not, which is how real GPS behaves.
+        """
+        return a.xy + a.gps_bias + self.rng.normal(0, 0.5, 2)
 
     @staticmethod
     def _bandwidth_for(mode: str) -> float:
