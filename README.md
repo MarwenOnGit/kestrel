@@ -86,6 +86,7 @@ found in IQ samples rather than derived from geometry. Still open: the trained
 classifier (Step 4), the ground map (Step 7), and everything needing hardware
 (Step 8).
 
+    pip install -r requirements.txt                              # numpy, pynacl, pytest
     python3 -m pytest tests/ -q                                  # 104 pass, 1 xfail
     python3 -m kestrel.sim.run --scenario border_crossing --iq   # fly a sortie on IQ
     python3 tools/dsp_demo.py                                    # the DSP funnel, one frame
