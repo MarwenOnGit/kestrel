@@ -148,9 +148,27 @@ class RecordingSidecar:
     freq_hz: float
     signal_class: str
     gps_track: list[tuple[float, float, float, int]] = field(default_factory=list)
+    # Provenance (Doc 14 §T1). `sha256` above is of the PLAINTEXT IQ and can
+    # only be checked after unsealing; `ciphertext_sha256` binds this sidecar to
+    # the exact bytes on disk, so evidence can be authenticated without opening
+    # it - and two recordings cannot be swapped between sidecars.
+    airframe_id: str = ""
+    ciphertext_sha256: str = ""
+    signature: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True)
+
+    def signed_body(self) -> dict[str, Any]:
+        """Everything the airframe signature covers: every field but itself."""
+        return signed_body_of(self.to_dict())
+
+
+def signed_body_of(sidecar: dict[str, Any]) -> dict[str, Any]:
+    """Works on a sidecar as read back from disk or from the audit log, where
+    tuples have become lists - the signature is over the JSON form."""
+    body = {k: v for k, v in sidecar.items() if k != "signature"}
+    return json.loads(json.dumps(body, sort_keys=True))

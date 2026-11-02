@@ -16,7 +16,8 @@ import time
 
 import numpy as np
 
-from kestrel.common.crypto import b64e, seal_to, sha256_hex
+from kestrel.common.crypto import seal_to, sha256_hex
+from kestrel.common.identity import RECORDING_CONTEXT, AirframeIdentity
 from kestrel.common.messages import Detection, RecordingSidecar
 
 
@@ -25,9 +26,22 @@ class VaultFullError(Exception):
 
 
 class Sealer:
-    def __init__(self, seal_pubkey_b64: str, vault_dir: str,
+    """Encrypt-to-ground, then sign-as-airframe.
+
+    Confidentiality and provenance are separate jobs. The sealed box gives the
+    first: only the ground HSM can read the take. It cannot give the second,
+    because the seal public key is in every warrant and an anonymous box has
+    no sender. The airframe signature over (sidecar, ciphertext hash) is what
+    lets the ground prove which aircraft made a recording and that neither the
+    file nor its metadata changed afterwards. `identity` is therefore required:
+    an unsigned recording is not evidence.
+    """
+
+    def __init__(self, seal_pubkey_b64: str, vault_dir: str, *,
+                 identity: AirframeIdentity,
                  capacity_bytes: int | None = None, durable: bool = True):
         self.seal_pubkey = seal_pubkey_b64
+        self.identity = identity
         self.vault_dir = vault_dir
         self.capacity_bytes = capacity_bytes
         self.durable = durable
@@ -58,6 +72,7 @@ class Sealer:
             raise VaultFullError("vault capacity exceeded")
 
         ciphertext = seal_to(self.seal_pubkey, raw)
+        ct_digest = sha256_hex(ciphertext)
 
         ref = f"{det.detection_id}.iqz"
         path = os.path.join(self.vault_dir, ref)
@@ -79,7 +94,11 @@ class Sealer:
             freq_hz=det.freq_hz,
             signal_class=det.signal_class,
             gps_track=gps_track or [],
+            airframe_id=self.identity.airframe_id,
+            ciphertext_sha256=ct_digest,
         )
+        sidecar.signature = self.identity.sign(RECORDING_CONTEXT,
+                                               sidecar.signed_body())
         with open(path + ".json", "w") as f:
             f.write(sidecar.to_json())
         return sidecar

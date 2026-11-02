@@ -12,6 +12,7 @@ import pytest
 from kestrel.air.sealer import CollectionController, Sealer
 from kestrel.air.warrant_gate import WarrantGate
 from kestrel.common import crypto
+from kestrel.common.identity import generate_airframe_identity
 from kestrel.common.messages import Detection
 from kestrel.common.warrant import TokenError, WarrantToken
 from kestrel.ground import signer
@@ -27,6 +28,11 @@ def keys():
     auth_sk, auth_pk = crypto.generate_authority_keypair()
     seal_sk, seal_pk = crypto.generate_seal_keypair()
     return dict(auth_sk=auth_sk, auth_pk=auth_pk, seal_sk=seal_sk, seal_pk=seal_pk)
+
+
+@pytest.fixture
+def ident():
+    return generate_airframe_identity("K1")
 
 
 @pytest.fixture
@@ -151,10 +157,11 @@ def test_every_denial_is_logged(keys, audit):
 
 
 # --------------------------------------------------------------- sealing
-def test_sealed_recording_unreadable_without_private_key(keys, audit, tmp_path):
+def test_sealed_recording_unreadable_without_private_key(keys, ident, audit, tmp_path):
     t = make_token(keys)
     controller = CollectionController(
-        WarrantGate(t, audit), Sealer(keys["seal_pk"], str(tmp_path / "vault")), audit)
+        WarrantGate(t, audit),
+        Sealer(keys["seal_pk"], str(tmp_path / "vault"), identity=ident), audit)
     iq = (np.random.randn(512) + 1j * np.random.randn(512)).astype(np.complex64)
     d = det()
     sidecar = controller.offer(d, iq, INSIDE, duration_s=1.0)
@@ -172,19 +179,21 @@ def test_sealed_recording_unreadable_without_private_key(keys, audit, tmp_path):
     assert crypto.sha256_hex(recovered) == sidecar.sha256
 
 
-def test_denied_detection_writes_nothing(keys, audit, tmp_path):
+def test_denied_detection_writes_nothing(keys, ident, audit, tmp_path):
     vault = str(tmp_path / "vault")
     controller = CollectionController(
-        WarrantGate(make_token(keys), audit), Sealer(keys["seal_pk"], vault), audit)
+        WarrantGate(make_token(keys), audit),
+        Sealer(keys["seal_pk"], vault, identity=ident), audit)
     iq = np.zeros(256, dtype=np.complex64)
     assert controller.offer(det(freq_hz=1842e6, signal_class="lte"), iq, INSIDE) is None
     assert os.listdir(vault) == []
 
 
-def test_vault_full_logs_gap_and_denies(keys, audit, tmp_path):
+def test_vault_full_logs_gap_and_denies(keys, ident, audit, tmp_path):
     controller = CollectionController(
         WarrantGate(make_token(keys), audit),
-        Sealer(keys["seal_pk"], str(tmp_path / "vault"), capacity_bytes=10), audit)
+        Sealer(keys["seal_pk"], str(tmp_path / "vault"), identity=ident,
+               capacity_bytes=10), audit)
     iq = np.zeros(4096, dtype=np.complex64)
     assert controller.offer(det(), iq, INSIDE) is None
     assert any(e["type"] == "STORAGE_UNAVAILABLE" for e in audit.entries())

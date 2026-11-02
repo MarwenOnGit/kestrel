@@ -24,6 +24,7 @@ from kestrel.air.planner import InfoGainPlanner
 from kestrel.air.safety import SafetyLayer
 from kestrel.air.sdr_source import SimulatedSdrSource
 from kestrel.air.sealer import CollectionController, Sealer
+from kestrel.common.identity import generate_airframe_identity
 from kestrel.air.sensor import RfSensor
 from kestrel.air.track import TrackStore
 from kestrel.air.warrant_gate import WarrantGate
@@ -31,6 +32,7 @@ from kestrel.common import crypto
 from kestrel.common.warrant import WarrantToken
 from kestrel.ground import signer
 from kestrel.ground.audit import AuditLog
+from kestrel.ground.evidence import verify_vault
 from kestrel.sim.simulated_df import SimulatedDf
 from kestrel.sim.world import Aircraft, KestrelSim
 
@@ -50,6 +52,9 @@ class MissionResult:
     token: Any = None
     workdir: str = ""
     sensor_health: dict = field(default_factory=dict)
+    airframe_registry: dict = field(default_factory=dict)
+    # {recording_ref: reason} for every recording the ground would refuse.
+    evidence_failures: dict = field(default_factory=dict)
 
 
 def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
@@ -114,10 +119,14 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
             "dwell_s": dwell_s,
             "revisit_time_s": sweep.revisit_time_s()})
 
+    airframe_registry: dict[str, str] = {}
     for ac in sim.aircraft:
         gate = WarrantGate(token, audit)
+        # Provisioned on the ground; only the verify key is registered.
+        identity = generate_airframe_identity(ac.aircraft_id)
+        airframe_registry[ac.aircraft_id] = identity.verify_key_b64
         sealer = Sealer(seal_pk, os.path.join(workdir, "vault", ac.aircraft_id),
-                        durable=durable)
+                        identity=identity, durable=durable)
         controller = CollectionController(gate, sealer, audit)
         safety = SafetyLayer(geofence, home_xy=tuple(ac.xy))
         planner = (planner_factory() if planner_factory else InfoGainPlanner())
@@ -190,6 +199,13 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
     audit.append("SORTIE_END", {"t": now})
     ok, _bad = audit.verify()
 
+    # ---- ground: authenticate every recording before anything is opened --
+    evidence_failures: dict[str, str] = {}
+    for acid, ag in agents.items():
+        evidence_failures.update(verify_vault(
+            [r.to_dict() for r in ag.controller.recordings],
+            os.path.join(workdir, "vault", acid), airframe_registry))
+
     tracks = {}
     for ag in agents.values():
         tracks.update(ag.tracks.tracks)
@@ -208,6 +224,8 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
         token=token,
         workdir=workdir,
         sensor_health={k: s.health() for k, s in sensors.items()},
+        airframe_registry=airframe_registry,
+        evidence_failures=evidence_failures,
     )
 
 
