@@ -92,3 +92,20 @@ def test_warrant_gate_is_deterministic():
             imported.add(node.module.split(".")[0])
     offenders = imported & banned
     assert not offenders, f"warrant_gate.py must not import {offenders}"
+
+
+def test_air_code_never_imports_lab_tooling():
+    """kestrel/lab/ decodes protocol content from public recordings. That is
+    validation tooling, and it must never become a capability of the aircraft:
+    content handling in the air is the warrant's business, not a library's."""
+    offenders = []
+    for path, src in _air_sources():
+        for node in ast.walk(ast.parse(src)):
+            mods = []
+            if isinstance(node, ast.Import):
+                mods = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                mods = [node.module]
+            if any(m.startswith("kestrel.lab") for m in mods):
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, f"kestrel/air must not import kestrel.lab: {offenders}"
