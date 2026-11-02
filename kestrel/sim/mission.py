@@ -182,7 +182,7 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
         if revoke_at_s is not None and now >= revoke_at_s:
             if not token.revoked:
                 token.revoke()
-                audit.append("REVOCATION", {"t": now})
+                audit.append("REVOCATION", {"warrant_id": token.warrant_id, "t": now})
 
         for ac in sim.alive_aircraft:
             ag = agents[ac.aircraft_id]

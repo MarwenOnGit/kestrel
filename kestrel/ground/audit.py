@@ -146,10 +146,13 @@ class AuditLog:
     # ------------------------------------------------------------------
     # Convenience recorders used across the codebase
     # ------------------------------------------------------------------
-    def record_decision(self, det, allowed: bool, reasons: list[str]) -> str:
+    def record_decision(self, det, allowed: bool, reasons: list[str],
+                        t: float | None = None) -> str:
         """Gate decisions are logged BOTH ways. Proving why something was not
-        collected matters as much as proving what was."""
-        return self.append("GATE_DECISION", {
+        collected matters as much as proving what was. `t` is the time the gate
+        decided at - its clock, not the log's - so a restarted gate can tell
+        whether its clock has gone backwards."""
+        payload = {
             "detection_id": det.detection_id,
             "aircraft_id": det.aircraft_id,
             "freq_hz": det.freq_hz,
@@ -157,7 +160,10 @@ class AuditLog:
             "class_confidence": det.class_confidence,
             "allowed": allowed,
             "reasons": reasons,
-        })
+        }
+        if t is not None:
+            payload["t"] = t
+        return self.append("GATE_DECISION", payload)
 
     def record_detection(self, det) -> str:
         # sanitized() strips every simulator-truth field. Never persist truth:
