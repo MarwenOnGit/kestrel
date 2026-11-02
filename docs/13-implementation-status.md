@@ -20,8 +20,16 @@ do not let it drift from the code.
 | 7. Ground station | Partial — audit + fusion primitives; no web map yet |
 | 8. Hardware bring-up | Blocked on hardware |
 
-**104 tests pass, 1 xfail** (a recorded known limitation, `strict=True`, so it
-fails the build if it starts unexpectedly passing).
+**143 tests pass, 3 xfail** (recorded known limitations, `strict=True`, so
+each fails the build if it starts unexpectedly passing: multi-emitter
+association, §4.1, and the classifier on real satellite signals, Doc 15 §3).
+
+> **Update 2026-11-02.** Two documents now follow this one.
+> [Doc 14](14-threat-model.md) attacks the legal spine; airframe-signed
+> recordings, signed audit checkpoints, and reboot-proof warrant state came
+> out of it. [Doc 15](15-real-signals.md) runs the DSP chain on 92 real
+> satellite downlinks. Detection carries over, classification does not, and
+> §5a's "classifies each correctly" should be read in that light.
 
     python3 -m pytest tests/ -q                # everything, ~5 min
     python3 -m pytest tests/ -q -m "not slow"  # skip the IQ-path sortie tests

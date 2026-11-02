@@ -178,9 +178,17 @@ asserts it (§7).
 **Layered with** full-disk LUKS encryption (Doc 03 §4) — so the disk is protected
 at rest *and* each recording is individually sealed.
 
-**Crypto-erase on expiry:** when the warrant expires or a mission aborts, the
-aircraft wipes session material and marks the vault closed. Sealed files remain
-(they are evidence) but no new writes are possible.
+**On expiry or abort, the vault closes.** No new writes are possible; sealed
+files remain, because they are evidence. An earlier draft called this
+"crypto-erase", but the aircraft never holds key material that can decrypt a
+recording, so there is nothing to erase that would protect the take. In the
+implementation (`Sealer.close()`) each recording is a sealed box with its own
+ephemeral key, and that key is gone as soon as the box is made. See Doc 14 §T6.
+
+**Provenance.** Sealing gives confidentiality, not attribution: the seal
+public key is printed in every warrant. Each recording is therefore also
+signed by the airframe's own key over the sidecar and the ciphertext hash, and
+checked on the ground before it is opened. See Doc 14 §T1.
 
 ---
 
