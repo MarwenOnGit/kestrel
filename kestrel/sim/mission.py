@@ -31,7 +31,7 @@ from kestrel.air.warrant_gate import WarrantGate
 from kestrel.common import crypto
 from kestrel.common.warrant import WarrantToken
 from kestrel.ground import signer
-from kestrel.ground.audit import AuditLog
+from kestrel.ground.audit import AuditLog, verify_audit
 from kestrel.ground.evidence import verify_vault
 from kestrel.sim.simulated_df import SimulatedDf
 from kestrel.sim.world import Aircraft, KestrelSim
@@ -91,7 +91,16 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
     raw_token = signer.quick_warrant(seal_pk, auth_sk, **(warrant_overrides or {}))
     token = WarrantToken.load(raw_token, auth_pk)
 
-    audit = AuditLog(os.path.join(workdir, "audit.jsonl"), durable=durable)
+    # The simulator keeps ONE log for the whole swarm, so it gets its own
+    # identity. Flight hardware keeps one log per airframe, checkpointed with
+    # that airframe's key. `downlinked` is what the ground receives over the
+    # datalink as each checkpoint is made.
+    airframe_registry: dict[str, str] = {}
+    downlinked: list[dict] = []
+    log_identity = generate_airframe_identity("swarm-log")
+    airframe_registry[log_identity.airframe_id] = log_identity.verify_key_b64
+    audit = AuditLog(os.path.join(workdir, "audit.jsonl"), durable=durable,
+                     identity=log_identity, on_checkpoint=downlinked.append)
     audit.append("SORTIE_START", {"warrant_id": token.warrant_id,
                                   "n_aircraft": len(sim.aircraft)})
 
@@ -119,7 +128,6 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
             "dwell_s": dwell_s,
             "revisit_time_s": sweep.revisit_time_s()})
 
-    airframe_registry: dict[str, str] = {}
     for ac in sim.aircraft:
         gate = WarrantGate(token, audit)
         # Provisioned on the ground; only the verify key is registered.
@@ -197,7 +205,8 @@ def run_mission(sim: KestrelSim, *, duration_s: float = 1800.0, dt: float = 1.0,
     for acid, s in sensors.items():
         audit.append("SENSOR_HEALTH", {"aircraft_id": acid, **s.health()})
     audit.append("SORTIE_END", {"t": now})
-    ok, _bad = audit.verify()
+    audit.close()
+    ok, _reason, _seq = verify_audit(audit.path, airframe_registry, downlinked)
 
     # ---- ground: authenticate every recording before anything is opened --
     evidence_failures: dict[str, str] = {}
